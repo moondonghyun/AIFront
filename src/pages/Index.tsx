@@ -2,28 +2,20 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
 
-// ─── Phase1 components (interview pipeline) ───
+// ─── Components ───
 import type { CatPersonality } from "@/components/CatCharacter";
 import IntroScreen, { type TrackChoice } from "@/components/IntroScreen";
 import HomepageInterviewScreen from "@/components/HomepageInterviewScreen";
 import HomepageResultScreen from "@/components/HomepageResultScreen";
-import HomepageUploadScreen from "@/components/HomepageUploadScreen";
-import QuestionScreen from "@/components/QuestionScreen";
-import ReviewScreen from "@/components/ReviewScreen";
 import SecondaryInterviewScreen from "@/components/SecondaryInterviewScreen";
-import BriefingReadyScreen from "@/components/BriefingReadyScreen";
 import BriefingCompleteScreen from "@/components/BriefingCompleteScreen";
-
-// ─── Phase2 components (home style + full app) ───
 import HomeStyleScreen from "@/components/HomeStyleScreen";
 import HomeStyleHandoffScreen from "@/components/HomeStyleHandoffScreen";
 import HomeStyleMdScreen from "@/components/HomeStyleMdScreen";
-import AdditionalContextScreen from "@/components/AdditionalContextScreen";
 import FullAppScreen from "@/components/FullAppScreen";
 
 // ─── Data ───
 import { homepageQuestions } from "@/data/homepage-questions";
-import { questions } from "@/data/questions";
 
 // ─── Types ───
 import type { GeneratedInterviewQuestion, InterviewHistoryEntry } from "@/lib/ai-types";
@@ -43,15 +35,13 @@ import {
   type InterviewProgress,
 } from "@/lib/briefing-state";
 
-// ─── Phase1 AI: Claude (interview pipeline) ───
+// ─── AI ───
 import {
   applyInterviewAnswersBatchDirect,
   generateHomepageMd,
   generateUIBriefingFromAnswers,
   generateInterviewQuestionBatchDirect,
 } from "@/lib/claude-direct";
-
-// ─── Phase2 AI: Gemini (home style + full app) ───
 import {
   generateRenderedHomeStyleOptionsDirect,
   generateHomeScreenMarkdownDirect,
@@ -60,47 +50,33 @@ import {
 } from "@/lib/gemini-direct";
 import type { FullWebProject } from "@/lib/gemini-direct";
 
-// ─── Combined Phase State Machine ───
+// ─── Phase State Machine ───
 //
-// Phase1 (interview pipeline):
-//   intro → homepage-interview → generating-homepage-md → homepage-result
-//     → homepage-upload → interview → review → generating-briefing → briefing-ready
-//
-// Phase2 (home style 3안):
+// intro → homepage-interview → generating-homepage-md → homepage-result
 //   → generating-home-style → home-style → home-style-selected
-//     → generating-home-style-md → home-style-md
-//
-// Phase1 (secondary interview, enriched with home style MD):
+//   → generating-home-style-md → home-style-md
+//   → generating-briefing (structured JSON from homepageMd + homeStyleMd)
 //   → generating-question → secondary-interview → applying-answer → (loop) → ui-ready
-//
-// Phase2 (final output):
-//   → additional-context → generating-full-app → full-app
+//   → generating-full-app → full-app
 
 type Phase =
-  // Phase1: intro + homepage interview
   | "intro"
   | "homepage-interview"
   | "generating-homepage-md"
   | "homepage-result"
-  | "homepage-upload"
-  // Phase1: main interview
-  | "interview"
-  | "review"
-  | "generating-briefing"
-  | "briefing-ready"
-  // Phase2: home style 3안
+  // Home style 3안
   | "generating-home-style"
   | "home-style"
   | "home-style-selected"
   | "generating-home-style-md"
   | "home-style-md"
-  // Phase1: secondary interview (enriched)
+  // Briefing generation + secondary interview
+  | "generating-briefing"
   | "generating-question"
   | "secondary-interview"
   | "applying-answer"
   | "ui-ready"
-  // Phase2: full app generation
-  | "additional-context"
+  // Full app generation
   | "generating-full-app"
   | "full-app";
 
@@ -145,7 +121,7 @@ const Index = () => {
   const [phase, setPhase] = useState<Phase>("intro");
   const [personality, setPersonality] = useState<CatPersonality>("smart");
 
-  // ─── Homepage interview state (Phase1) ───
+  // ─── Homepage interview state ───
   const [hpStep, setHpStep] = useState(0);
   const [hpAnswers, setHpAnswers] = useState<string[]>(
     Array(homepageQuestions.length).fill(""),
@@ -153,10 +129,7 @@ const Index = () => {
   const [hpDirection, setHpDirection] = useState<1 | -1>(1);
   const [homepageMd, setHomepageMd] = useState<string | null>(null);
 
-  // ─── Main interview state (Phase1) ───
-  const [currentStep, setCurrentStep] = useState(0);
-  const [answers, setAnswers] = useState<string[]>(Array(questions.length).fill(""));
-  const [direction, setDirection] = useState<1 | -1>(1);
+  // ─── Briefing & interview state ───
   const [briefingJson, setBriefingJson] = useState<Record<string, unknown> | null>(null);
   const [initialTargetPaths, setInitialTargetPaths] = useState<string[]>([]);
   const [currentInterviewQuestions, setCurrentInterviewQuestions] = useState<
@@ -166,7 +139,7 @@ const Index = () => {
   const interviewRound = useRef(0);
   const totalQuestionsAsked = useRef(0);
 
-  // ─── Home style state (Phase2) ───
+  // ─── Home style state ───
   const [designDocument] = useState<DesignDocument | null>(null);
   const [generatedHomeStyleSet, setGeneratedHomeStyleSet] =
     useState<RenderedHomeStyleSet | null>(null);
@@ -174,8 +147,7 @@ const Index = () => {
     useState<RenderedHomeStyleOption | null>(null);
   const [homeStyleMd, setHomeStyleMd] = useState<string | null>(null);
 
-  // ─── Full app state (Phase2) ───
-  const [additionalContext, setAdditionalContext] = useState<string | null>(null);
+  // ─── Full app state ───
   const [generatedFullApp, setGeneratedFullApp] = useState<FullWebProject | null>(null);
 
   const projectName = useMemo(
@@ -184,7 +156,7 @@ const Index = () => {
   );
 
   // ═══════════════════════════════════════════════════════════════════
-  // PHASE 1: Homepage interview handlers
+  // Homepage interview handlers
   // ═══════════════════════════════════════════════════════════════════
 
   const updateHpAnswer = useCallback((index: number, value: string) => {
@@ -202,7 +174,6 @@ const Index = () => {
       return;
     }
 
-    // Last question → generate homepage MD
     setPhase("generating-homepage-md");
     const qaList = homepageQuestions.map((q, i) => ({
       question: q.title,
@@ -229,88 +200,36 @@ const Index = () => {
   }, [hpStep]);
 
   // ═══════════════════════════════════════════════════════════════════
-  // PHASE 1: Main interview handlers
+  // homepage-result → home style 3안
   // ═══════════════════════════════════════════════════════════════════
 
-  const updateAnswer = useCallback((index: number, value: string) => {
-    setAnswers((prev) => {
-      const next = [...prev];
-      next[index] = value;
-      return next;
-    });
-  }, []);
+  const handleContinueToHomeStyle = useCallback(async () => {
+    if (!homepageMd) return;
 
-  const goNext = useCallback(() => {
-    const currentQuestion = questions[currentStep];
-    if (currentQuestion.skipLogic) {
-      const { value, skipTo } = currentQuestion.skipLogic;
-      if (answers[currentStep] === value) {
-        const skipToIndex = questions.findIndex((q) => q.id === skipTo);
-        if (skipToIndex !== -1 && skipToIndex < questions.length) {
-          setDirection(1);
-          setCurrentStep(skipToIndex);
-          return;
-        }
-      }
-    }
+    // Markdown briefing for home style generation (supports this format)
+    const mdBriefing: Record<string, unknown> = {
+      _format: "markdown",
+      content: homepageMd,
+    };
+    setBriefingJson(mdBriefing);
 
-    if (currentStep < questions.length - 1) {
-      setDirection(1);
-      setCurrentStep((step) => step + 1);
-      return;
-    }
-
-    setPhase("review");
-  }, [currentStep, answers]);
-
-  const goPrev = useCallback(() => {
-    if (currentStep > 0) {
-      setDirection(-1);
-      setCurrentStep((step) => step - 1);
-    }
-  }, [currentStep]);
-
-  const goToQuestion = useCallback(
-    (index: number) => {
-      setDirection(index > currentStep ? 1 : -1);
-      setCurrentStep(index);
-      setPhase("interview");
-    },
-    [currentStep],
-  );
-
-  // ═══════════════════════════════════════════════════════════════════
-  // PHASE 1 → 2 transition: Review complete → generate briefing → home style
-  // ═══════════════════════════════════════════════════════════════════
-
-  const handleReviewComplete = useCallback(async () => {
-    setPhase("generating-briefing");
-    setCurrentInterviewQuestions([]);
-    setInterviewHistory([]);
-    interviewRound.current = 0;
-
-    const qaList = questions.map((q, i) => ({
-      question: q.title,
-      answer: answers[i] || "",
-    }));
-
+    setPhase("generating-home-style");
     try {
-      const json = await generateUIBriefingFromAnswers(qaList, homepageMd);
-      const targets = collectInterviewTargets(json);
-      const targetPaths = targets.map((t) => t.path);
-
-      setBriefingJson(json);
-      setInitialTargetPaths(targetPaths);
-      setPhase("briefing-ready");
+      const generatedSet = await generateRenderedHomeStyleOptionsDirect({
+        briefingJson: mdBriefing,
+      });
+      setGeneratedHomeStyleSet(generatedSet);
+      setPhase("home-style");
+      toast.success("홈 화면 3안을 생성했습니다.");
     } catch (error) {
-      console.error("Failed to generate briefing JSON:", error);
-      toast.error("UI 브리핑 생성에 실패했습니다.");
-      setPhase("review");
+      console.error("Failed to generate home styles:", error);
+      toast.error("홈 화면 3안 생성에 실패했습니다.");
+      setPhase("homepage-result");
     }
-  }, [answers, homepageMd]);
+  }, [homepageMd]);
 
   // ═══════════════════════════════════════════════════════════════════
-  // PHASE 2: Home style generation (after briefing-ready)
+  // Home style generation & selection
   // ═══════════════════════════════════════════════════════════════════
 
   const handleGenerateHomeStyles = useCallback(async () => {
@@ -325,7 +244,7 @@ const Index = () => {
     } catch (error) {
       console.error("Failed to generate home styles:", error);
       toast.error("홈 화면 3안 생성에 실패했습니다.");
-      setPhase("briefing-ready");
+      setPhase("homepage-result");
     }
   }, [briefingJson]);
 
@@ -370,7 +289,50 @@ const Index = () => {
   );
 
   // ═══════════════════════════════════════════════════════════════════
-  // PHASE 1 (resumed): Secondary interview with home style context
+  // home-style-md → generate structured briefing JSON → secondary interview
+  // ═══════════════════════════════════════════════════════════════════
+
+  const handleGenerateBriefingAndStartInterview = useCallback(async () => {
+    setPhase("generating-briefing");
+    setCurrentInterviewQuestions([]);
+    setInterviewHistory([]);
+    interviewRound.current = 0;
+    totalQuestionsAsked.current = 0;
+
+    // Build QA from homepage interview answers
+    const qaList = homepageQuestions.map((q, i) => ({
+      question: q.title,
+      answer: hpAnswers[i] || "",
+    }));
+
+    // Combine homepageMd + homeStyleMd as context for briefing generation
+    const combinedMd = [
+      homepageMd || "",
+      "",
+      "━━ 선택된 홈 화면 스타일 명세 ━━",
+      homeStyleMd || "",
+    ].join("\n");
+
+    try {
+      // Generate structured briefing JSON with {value, status} fields
+      const json = await generateUIBriefingFromAnswers(qaList, combinedMd);
+      const targets = collectInterviewTargets(json);
+      const targetPaths = targets.map((t) => t.path);
+
+      setBriefingJson(json);
+      setInitialTargetPaths(targetPaths);
+
+      // Immediately start secondary interview
+      await requestNextInterviewBatch(json, targetPaths, []);
+    } catch (error) {
+      console.error("Failed to generate briefing JSON:", error);
+      toast.error("UI 브리핑 생성에 실패했습니다.");
+      setPhase("home-style-md");
+    }
+  }, [hpAnswers, homepageMd, homeStyleMd]);
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Secondary interview loop
   // ═══════════════════════════════════════════════════════════════════
 
   const requestNextInterviewBatch = useCallback(
@@ -439,12 +401,6 @@ const Index = () => {
     [],
   );
 
-  const handleStartSecondary = useCallback(async () => {
-    if (!briefingJson) return;
-    totalQuestionsAsked.current = 0;
-    await requestNextInterviewBatch(briefingJson, initialTargetPaths, []);
-  }, [briefingJson, initialTargetPaths, requestNextInterviewBatch]);
-
   const handleInterviewComplete = useCallback(
     async (answersByQuestionId: Record<string, string>) => {
       if (!briefingJson || currentInterviewQuestions.length === 0) return;
@@ -509,33 +465,29 @@ const Index = () => {
   );
 
   // ═══════════════════════════════════════════════════════════════════
-  // PHASE 2 (final): Full app generation
+  // ui-ready → directly generate full app (no additional-context)
   // ═══════════════════════════════════════════════════════════════════
 
-  const handleGenerateFullApp = useCallback(
-    async (ctx?: string | null) => {
-      if (!briefingJson) return;
-      const context = ctx !== undefined ? ctx : additionalContext;
-      const md = homeStyleMd ?? "";
-      setPhase("generating-full-app");
-      try {
-        const result = await generateFullAppDirect({
-          briefingJson,
-          homeStyleMd: md,
-          designDocument,
-          additionalContext: context,
-        });
-        setGeneratedFullApp(result);
-        setPhase("full-app");
-        toast.success("전체 앱 구현이 완료되었습니다.");
-      } catch (error) {
-        console.error("Failed to generate full app:", error);
-        toast.error("전체 앱 구현에 실패했습니다.");
-        setPhase("additional-context");
-      }
-    },
-    [briefingJson, homeStyleMd, designDocument, additionalContext],
-  );
+  const handleGenerateFullApp = useCallback(async () => {
+    if (!briefingJson) return;
+    const md = homeStyleMd ?? "";
+    setPhase("generating-full-app");
+    try {
+      const result = await generateFullAppDirect({
+        briefingJson,
+        homeStyleMd: md,
+        designDocument,
+        additionalContext: null,
+      });
+      setGeneratedFullApp(result);
+      setPhase("full-app");
+      toast.success("전체 앱 구현이 완료되었습니다.");
+    } catch (error) {
+      console.error("Failed to generate full app:", error);
+      toast.error("전체 앱 구현에 실패했습니다.");
+      setPhase("ui-ready");
+    }
+  }, [briefingJson, homeStyleMd, designDocument]);
 
   // ═══════════════════════════════════════════════════════════════════
   // Derived state
@@ -551,7 +503,6 @@ const Index = () => {
     phase === "home-style-selected" ||
     phase === "generating-home-style-md" ||
     phase === "home-style-md" ||
-    phase === "additional-context" ||
     phase === "generating-full-app" ||
     phase === "full-app";
 
@@ -563,29 +514,35 @@ const Index = () => {
     <div className="flex min-h-screen items-center justify-center bg-background p-4">
       <div className={`w-full ${isWideCanvas ? "max-w-[1520px]" : "max-w-[640px]"}`}>
         <AnimatePresence mode="wait">
-          {/* ── Phase1: Intro ── */}
+          {/* ── Intro ── */}
           {phase === "intro" && (
             <IntroScreen
               key="intro"
               onStart={(track: TrackChoice, p: CatPersonality) => {
                 setPersonality(p);
-                if (track === "full") {
-                  setPhase("homepage-interview");
-                } else if (track === ("full-skip-homepage" as TrackChoice)) {
-                  setPhase("homepage-upload");
-                }
+                setPhase("homepage-interview");
               }}
               onLoadJson={(json) => {
-                const targets = collectInterviewTargets(json);
                 setBriefingJson(json);
+                const targets = collectInterviewTargets(json);
                 setInitialTargetPaths(targets.map((t) => t.path));
                 setPersonality("smart");
-                setPhase("briefing-ready");
+                setPhase("generating-home-style");
+                generateRenderedHomeStyleOptionsDirect({ briefingJson: json })
+                  .then((set) => {
+                    setGeneratedHomeStyleSet(set);
+                    setPhase("home-style");
+                    toast.success("홈 화면 3안을 생성했습니다.");
+                  })
+                  .catch(() => {
+                    toast.error("홈 화면 3안 생성에 실패했습니다.");
+                    setPhase("intro");
+                  });
               }}
             />
           )}
 
-          {/* ── Phase1: Homepage interview ── */}
+          {/* ── Homepage interview ── */}
           {phase === "homepage-interview" && (
             <HomepageInterviewScreen
               key={`hp-${hpStep}`}
@@ -599,84 +556,18 @@ const Index = () => {
             />
           )}
 
+          {/* ── Homepage MD result → home style ── */}
           {(phase === "generating-homepage-md" || phase === "homepage-result") && (
             <HomepageResultScreen
               key="hp-result"
               markdown={homepageMd}
               isGenerating={phase === "generating-homepage-md"}
               personality={personality}
-              onContinue={() => setPhase("homepage-upload")}
+              onContinue={handleContinueToHomeStyle}
             />
           )}
 
-          {phase === "homepage-upload" && (
-            <HomepageUploadScreen
-              key="hp-upload"
-              personality={personality}
-              autoMd={homepageMd}
-              onComplete={(md) => {
-                if (md) setHomepageMd(md);
-                setPhase("interview");
-              }}
-              onSkip={() => setPhase("interview")}
-            />
-          )}
-
-          {/* ── Phase1: Main interview (13 questions) ── */}
-          {phase === "interview" && (
-            <QuestionScreen
-              key={`q-${currentStep}`}
-              question={questions[currentStep]}
-              step={currentStep}
-              total={questions.length}
-              answer={answers[currentStep]}
-              direction={direction}
-              personality={personality}
-              onAnswer={(value) => updateAnswer(currentStep, value)}
-              onNext={goNext}
-              onPrev={goPrev}
-              isFirst={currentStep === 0}
-              isLast={currentStep === questions.length - 1}
-              prevAnswer={currentStep > 0 ? answers[currentStep - 1] : ""}
-            />
-          )}
-
-          {phase === "review" && (
-            <ReviewScreen
-              key="review"
-              answers={answers}
-              onEdit={goToQuestion}
-              onNext={handleReviewComplete}
-            />
-          )}
-
-          {/* ── Briefing generation loading ── */}
-          {phase === "generating-briefing" && (
-            <SecondaryInterviewScreen
-              key="generating-briefing"
-              questions={[]}
-              progress={defaultInterviewProgress}
-              personality={personality}
-              isLoading={true}
-              loadingTitle="UI 브리핑을 준비하고 있어요"
-              loadingDescription="1차 인터뷰 답변을 분석해서 UI 설계용 브리핑 JSON을 만들고 있습니다."
-              onComplete={() => {}}
-              onBack={() => setPhase("review")}
-              round={0}
-            />
-          )}
-
-          {/* ── Briefing ready → launch home style generation ── */}
-          {phase === "briefing-ready" && briefingJson && (
-            <BriefingReadyScreen
-              key="briefing-ready"
-              briefingJson={briefingJson}
-              personality={personality}
-              onNext={handleGenerateHomeStyles}
-            />
-          )}
-
-          {/* ── Phase2: Home style 3안 ── */}
+          {/* ── Home style 3안 ── */}
           {(phase === "generating-home-style" || phase === "home-style") &&
             briefingJson && (
               <HomeStyleScreen
@@ -691,7 +582,7 @@ const Index = () => {
                 onGenerate={handleGenerateHomeStyles}
                 onSelect={handleSelectHomeStyle}
                 onRefine={handleRefineHomeStyle}
-                onBack={() => setPhase("briefing-ready")}
+                onBack={() => setPhase("homepage-result")}
               />
             )}
 
@@ -717,12 +608,13 @@ const Index = () => {
                 homeStyleMd={homeStyleMd}
                 isGenerating={phase === "generating-home-style-md"}
                 onBack={() => setPhase("home-style-selected")}
-                onNext={handleStartSecondary}
+                onNext={handleGenerateBriefingAndStartInterview}
               />
             )}
 
-          {/* ── Phase1 (resumed): Secondary interview ── */}
-          {(phase === "generating-question" ||
+          {/* ── Briefing generation + secondary interview ── */}
+          {(phase === "generating-briefing" ||
+            phase === "generating-question" ||
             phase === "applying-answer" ||
             phase === "secondary-interview") && (
             <SecondaryInterviewScreen
@@ -733,17 +625,23 @@ const Index = () => {
               progress={interviewProgress}
               personality={personality}
               isLoading={
-                phase === "generating-question" || phase === "applying-answer"
+                phase === "generating-briefing" ||
+                phase === "generating-question" ||
+                phase === "applying-answer"
               }
               loadingTitle={
-                phase === "applying-answer"
-                  ? "답변을 UI 브리핑에 반영하고 있어요"
-                  : "다음 질문 묶음을 준비하고 있어요"
+                phase === "generating-briefing"
+                  ? "홈 화면 스타일을 바탕으로 UI 브리핑을 만들고 있어요"
+                  : phase === "applying-answer"
+                    ? "답변을 UI 브리핑에 반영하고 있어요"
+                    : "다음 질문 묶음을 준비하고 있어요"
               }
               loadingDescription={
-                phase === "applying-answer"
-                  ? "답변을 분석해서 UI 브리핑의 빈 항목을 채우고 있습니다."
-                  : "남은 UI 항목을 묶어서 최대 10개의 질문으로 정리하고 있습니다."
+                phase === "generating-briefing"
+                  ? "홈페이지 설계 문서와 선택한 홈 화면 스타일을 분석해서 구조화된 UI 브리핑을 만들고 있습니다."
+                  : phase === "applying-answer"
+                    ? "답변을 분석해서 UI 브리핑의 빈 항목을 채우고 있습니다."
+                    : "남은 UI 항목을 묶어서 최대 10개의 질문으로 정리하고 있습니다."
               }
               onComplete={handleInterviewComplete}
               onBack={() => setPhase("home-style-md")}
@@ -751,7 +649,7 @@ const Index = () => {
             />
           )}
 
-          {/* ── ui-ready: secondary interview complete → full app ── */}
+          {/* ── ui-ready → directly to full app generation ── */}
           {phase === "ui-ready" && briefingJson && (
             <BriefingCompleteScreen
               key="ui-ready"
@@ -759,38 +657,20 @@ const Index = () => {
               progress={interviewProgress}
               selectedHomeStyle={selectedHomeStyle}
               onBack={() => setPhase("home-style-md")}
-              onNext={() => setPhase("additional-context")}
+              onNext={handleGenerateFullApp}
             />
           )}
 
-          {/* ── Phase2: Additional context + full app ── */}
-          {phase === "additional-context" && selectedHomeStyle && (
-            <AdditionalContextScreen
-              key="additional-context"
+          {(phase === "generating-full-app" || phase === "full-app") && (
+            <FullAppScreen
+              key="full-app"
               projectName={projectName}
+              fullApp={generatedFullApp ?? { previewHtml: "", files: [] }}
+              isGenerating={phase === "generating-full-app"}
               onBack={() => setPhase("ui-ready")}
-              onSubmit={(ctx) => {
-                setAdditionalContext(ctx);
-                void handleGenerateFullApp(ctx);
-              }}
-              onSkip={() => {
-                setAdditionalContext(null);
-                void handleGenerateFullApp(null);
-              }}
+              onRegenerate={() => void handleGenerateFullApp()}
             />
           )}
-
-          {(phase === "generating-full-app" || phase === "full-app") &&
-            selectedHomeStyle && (
-              <FullAppScreen
-                key="full-app"
-                projectName={projectName}
-                fullApp={generatedFullApp ?? { previewHtml: "", files: [] }}
-                isGenerating={phase === "generating-full-app"}
-                onBack={() => setPhase("additional-context")}
-                onRegenerate={() => void handleGenerateFullApp()}
-              />
-            )}
         </AnimatePresence>
       </div>
     </div>

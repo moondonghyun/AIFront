@@ -1,6 +1,7 @@
 export type AiProviderId = "gemini";
 export type AiTaskId =
   | "initialBriefing"
+  | "homepageMd"
   | "secondaryInterviewQuestion"
   | "secondaryInterviewFill"
   | "designDocument"
@@ -43,6 +44,13 @@ export const AI_TASKS: Record<AiTaskId, AiTaskConfig> = {
     provider: "gemini",
     defaultModel: "gemini-2.5-flash-lite",
     modelEnvKey: "VITE_GEMINI_MODEL_INITIAL_BRIEFING",
+  },
+  homepageMd: {
+    id: "homepageMd",
+    label: "홈페이지 MD 생성",
+    provider: "gemini",
+    defaultModel: "gemini-2.5-flash-lite",
+    modelEnvKey: "VITE_GEMINI_MODEL_HOMEPAGE_MD",
   },
   secondaryInterviewQuestion: {
     id: "secondaryInterviewQuestion",

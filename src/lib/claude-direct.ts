@@ -4,26 +4,16 @@ import type {
   InterviewHistoryEntry,
 } from "@/lib/ai-types";
 import type { InterviewTarget } from "@/lib/briefing-state";
+import { getAiTaskRuntime, type AiTaskId } from "@/lib/ai-config";
 
-// ─── Claude API helpers ───────────────────────────────────────────
+// ─── Gemini API helpers (replaces Claude transport) ─────────────────
 
-interface ClaudeRequestOptions {
+interface GeminiRequestOptions {
+  taskId: AiTaskId;
   systemPrompt: string;
   userPrompt: string;
-  model: "opus" | "sonnet";
   temperature?: number;
-  maxTokens?: number;
-}
-
-function getClaudeApiKey(): string {
-  return (import.meta.env.VITE_CLAUDE_API_KEY || "").trim();
-}
-
-function resolveModelId(model: "opus" | "sonnet"): string {
-  if (model === "opus") {
-    return import.meta.env.VITE_CLAUDE_OPUS_MODEL || "claude-opus-4-20250514";
-  }
-  return import.meta.env.VITE_CLAUDE_SONNET_MODEL || "claude-sonnet-4-20250514";
+  timeoutMs?: number;
 }
 
 function extractJsonFromText(text: string): string {
@@ -32,84 +22,96 @@ function extractJsonFromText(text: string): string {
   return firstBrace === -1 ? cleaned : cleaned.slice(firstBrace);
 }
 
-const MAX_RETRIES = 3;
-const RETRY_DELAYS = [3000, 6000, 12000];
-
-async function fetchClaudeWithRetry(
-  apiKey: string,
-  body: Record<string, unknown>,
-): Promise<string> {
-  let lastError: Error | null = null;
-
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    if (attempt > 0) {
-      const delay = RETRY_DELAYS[attempt - 1] || 12000;
-      console.log(`[Claude] 재시도 ${attempt}/${MAX_RETRIES} (${delay / 1000}초 후)...`);
-      await new Promise((r) => setTimeout(r, delay));
-    }
-
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-        "anthropic-dangerous-direct-browser-access": "true",
-      },
-      body: JSON.stringify(body),
-    });
-
-    if (response.ok) {
-      const payload = (await response.json()) as {
-        content: Array<{ type: string; text?: string }>;
-      };
-
-      const text = payload.content
-        .filter((block) => block.type === "text" && typeof block.text === "string")
-        .map((block) => block.text!)
-        .join("")
-        .trim();
-
-      if (!text) {
-        throw new Error("Claude returned an empty response");
-      }
-
-      return text;
-    }
-
-    if (response.status === 529 || response.status === 503 || response.status === 500) {
-      const errorText = await response.text();
-      lastError = new Error(`Claude request failed (${response.status}): ${errorText.slice(0, 400)}`);
-      console.warn(`[Claude] ${response.status} 에러, ${attempt < MAX_RETRIES ? "재시도합니다..." : "최대 재시도 횟수 초과"}`);
-      continue;
-    }
-
-    const errorText = await response.text();
-    throw new Error(`Claude request failed (${response.status}): ${errorText.slice(0, 400)}`);
-  }
-
-  throw lastError || new Error("Claude request failed after retries");
-}
-
-async function requestClaudeJson<T>({
+async function requestGeminiJson<T>({
+  taskId,
   systemPrompt,
   userPrompt,
-  model,
   temperature = 0.2,
-  maxTokens = 16384,
-}: ClaudeRequestOptions): Promise<T> {
-  const apiKey = getClaudeApiKey();
+  timeoutMs,
+}: GeminiRequestOptions): Promise<T> {
+  const runtime = getAiTaskRuntime(taskId);
+  const apiKey = runtime.apiKey;
   if (!apiKey) {
-    throw new Error("VITE_CLAUDE_API_KEY is not configured");
+    throw new Error(`${runtime.provider.apiKeyEnvKeys[0]} is not configured`);
   }
 
-  const text = await fetchClaudeWithRetry(apiKey, {
-    model: resolveModelId(model),
-    max_tokens: maxTokens,
-    temperature,
-    system: systemPrompt,
-    messages: [{ role: "user", content: userPrompt }],
-  });
+  const modelsToTry = [runtime.model, ...runtime.fallbackModels.filter((m) => m !== runtime.model)];
+  let payload: Record<string, unknown> | null = null;
+  let lastError: Error | null = null;
+
+  for (const model of modelsToTry) {
+    console.log(`[Gemini:${taskId}] trying model: ${model}`);
+
+    const controller = timeoutMs ? new AbortController() : null;
+    const timerId = controller && timeoutMs
+      ? window.setTimeout(() => controller.abort(), timeoutMs)
+      : null;
+
+    try {
+      const response = await fetch(
+        `${runtime.provider.baseUrl}/${model}:generateContent?key=${apiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller?.signal,
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: systemPrompt }] },
+            contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+            generationConfig: {
+              temperature,
+              responseMimeType: "application/json",
+            },
+          }),
+        },
+      );
+
+      if (response.ok) {
+        payload = (await response.json()) as Record<string, unknown>;
+        break;
+      }
+
+      const errorText = await response.text();
+      lastError = new Error(`Gemini request failed (${response.status}): ${errorText.slice(0, 400)}`);
+      console.warn(`[Gemini:${taskId}] model ${model} failed with ${response.status}`);
+
+      if (response.status !== 404 && response.status !== 503) {
+        throw lastError;
+      }
+    } catch (err) {
+      if ((err as Error).name === "AbortError") {
+        lastError = new Error(`Gemini request timed out after ${timeoutMs}ms`);
+      } else {
+        throw err;
+      }
+    } finally {
+      if (timerId !== null) window.clearTimeout(timerId);
+    }
+  }
+
+  if (!payload) {
+    throw lastError ?? new Error("Gemini request failed");
+  }
+
+  const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
+  const firstCandidate =
+    candidates[0] && typeof candidates[0] === "object"
+      ? (candidates[0] as Record<string, unknown>)
+      : null;
+  const content =
+    firstCandidate && typeof firstCandidate.content === "object"
+      ? (firstCandidate.content as Record<string, unknown>)
+      : null;
+  const parts = content && Array.isArray(content.parts) ? content.parts : [];
+  const text = parts
+    .map((part: Record<string, unknown>) =>
+      part && typeof part.text === "string" ? part.text : "",
+    )
+    .join("")
+    .trim();
+
+  if (!text) {
+    throw new Error("Gemini returned an empty response");
+  }
 
   try {
     return JSON.parse(text) as T;
@@ -118,28 +120,7 @@ async function requestClaudeJson<T>({
   }
 }
 
-async function requestClaudeText({
-  systemPrompt,
-  userPrompt,
-  model,
-  temperature = 0.3,
-  maxTokens = 16384,
-}: ClaudeRequestOptions): Promise<string> {
-  const apiKey = getClaudeApiKey();
-  if (!apiKey) {
-    throw new Error("VITE_CLAUDE_API_KEY is not configured");
-  }
-
-  return fetchClaudeWithRetry(apiKey, {
-    model: resolveModelId(model),
-    max_tokens: maxTokens,
-    temperature,
-    system: systemPrompt,
-    messages: [{ role: "user", content: userPrompt }],
-  });
-}
-
-// ─── Shared utilities (mirrored from gemini-direct) ───────────────
+// ─── Shared utilities ───────────────────────────────────────────────
 
 function coerceString(value: unknown, fallback = ""): string {
   return typeof value === "string" && value.trim() ? value.trim() : fallback;
@@ -153,9 +134,7 @@ function normalizeStringArray(value: unknown): string[] {
 
 function createFallbackQuestion(targets: InterviewTarget[]): GeneratedInterviewQuestion | null {
   const firstTarget = targets[0];
-  if (!firstTarget) {
-    return null;
-  }
+  if (!firstTarget) return null;
 
   const context = firstTarget.parentContext
     ? `${firstTarget.parentContext} > ${firstTarget.label}`
@@ -254,21 +233,14 @@ function normalizeQuestionBatchPayload(
 }
 
 function normalizeUpdatePayload(payload: unknown): InterviewFieldUpdate[] {
-  if (!Array.isArray(payload)) {
-    return [];
-  }
+  if (!Array.isArray(payload)) return [];
 
   return payload
     .map((item): InterviewFieldUpdate | null => {
-      if (!item || typeof item !== "object") {
-        return null;
-      }
-
+      if (!item || typeof item !== "object") return null;
       const record = item as Record<string, unknown>;
       const path = coerceString(record.path);
-      if (!path) {
-        return null;
-      }
+      if (!path) return null;
 
       return {
         path,
@@ -283,10 +255,10 @@ function normalizeUpdatePayload(payload: unknown): InterviewFieldUpdate[] {
     .filter((item): item is InterviewFieldUpdate => item !== null);
 }
 
-// ─── Exported functions ───────────────────────────────────────────
+// ─── Exported functions (all using Gemini API) ──────────────────────
 
 /**
- * 1차 인터뷰 답변 → UI 브리핑 JSON 생성 (Claude Opus)
+ * 1차 인터뷰 답변 → UI 브리핑 JSON 생성
  */
 export async function generateUIBriefingFromAnswers(
   qaList: Array<{ question: string; answer: string }>,
@@ -340,104 +312,42 @@ export async function generateUIBriefingFromAnswers(
     "    - error / success / warning: 상태 색상",
     "",
     "  typography_hierarchy: (각 레벨의 size·weight·line_height·use_case)",
-    "    - display: 가장 큰 제목 (히어로, 온보딩)",
-    "    - heading: 섹션 제목",
-    "    - subheading: 소제목",
-    "    - body: 본문",
-    "    - caption: 보조 텍스트, 날짜, 레이블",
-    "    - label: 버튼·태그·배지 텍스트",
+    "    - display / heading / subheading / body / caption / label",
     "",
     "  spacing_rules:",
-    "    - base_unit: 기본 단위 (4px 또는 8px)",
-    "    - screen_horizontal_padding: 좌우 여백",
-    "    - section_gap: 섹션 간 간격",
-    "    - component_gap: 컴포넌트 간 간격",
-    "    - density: compact / comfortable / spacious",
+    "    - base_unit / screen_horizontal_padding / section_gap / component_gap / density",
     "",
     "  component_style:",
-    "    - button: shape(pill/rounded/square), filled_style, outlined_style, size_variants",
-    "    - card: border_radius, elevation(shadow), border, inner_padding",
-    "    - input: style(outlined/filled/underline), border_radius, focus_indicator",
-    "    - badge_chip: shape, size",
+    "    - button / card / input / badge_chip",
     "",
-    "  layout_patterns: (이 앱에서 실제로 쓰이는 패턴만 포함)",
-    "    - primary_list_style: 주력 리스트 형태 (card-list / row-list / grid)",
-    "    - grid_columns: 그리드 사용 시 열 수",
-    "    - tab_style: 탭 스타일 (top-tab / bottom-tab / pill-tab)",
-    "    - sheet_usage: 바텀시트·모달 사용 방식",
-    "    - global_nav_pattern: 앱 전역 내비게이션 패턴 (bottom-nav / side-drawer / top-tab)",
+    "  layout_patterns:",
+    "    - primary_list_style / grid_columns / tab_style / sheet_usage / global_nav_pattern",
     "",
     "  bottom_nav_tabs: (global_nav_pattern이 bottom-nav일 때 필수)",
-    "    각 탭: tab_name / icon_hint(아이콘 이름 또는 설명) / linked_screen(screens 키) / badge_condition(뱃지 표시 조건, 없으면 null)",
+    "    각 탭: tab_name / icon_hint / linked_screen / badge_condition",
     "",
     "  breakpoints: (웹 또는 '둘 다' 플랫폼일 때 포함)",
-    "    - mobile: max_width, layout_changes(예: 1열 그리드, 하단 네비)",
-    "    - tablet: min_width, max_width, layout_changes",
-    "    - desktop: min_width, layout_changes(예: 사이드바 네비, 2~3열 그리드)",
+    "    - mobile / tablet / desktop",
     "",
-    "  shared_states: (공통 상태 UI — 각 화면은 이걸 참조하거나 override만 정의)",
-    "    - loading: indicator_type(spinner/skeleton/shimmer), overlay_style",
-    "    - empty_state: illustration_style, message_tone, cta_presence",
-    "    - error_state: display_type(inline/fullscreen/toast), retry_mechanism",
-    "    - toast_notification: position(top/bottom), style, duration",
+    "  shared_states:",
+    "    - loading / empty_state / error_state / toast_notification",
     "",
     "━━ 3. screens ━━",
-    "이 서비스에 필요한 모든 화면. user_flows에서 참조하는 화면은 반드시 여기에 존재해야 한다.",
-    "인터뷰에서 언급된 화면뿐 아니라, 서비스 흐름상 당연히 필요한 화면(온보딩, 로그인, 설정 등)도 null 스켈레톤으로 포함한다.",
-    "",
-    "  필수 공통 필드:",
-    "    - screenName: 화면 이름",
-    "    - purpose: 이 화면의 역할",
-    "    - targetUsers: 이 화면에 접근 가능한 유저 역할",
-    "    - headerType: transparent / solid / hidden / large-title / custom",
-    "    - navigationType: stack-push / tab-switch / modal / bottom-sheet",
-    "    - layoutType: feed / card-grid / list / form / dashboard / detail / splash",
-    "    - transition_type: 이 화면으로 진입할 때 전환 애니메이션 (slide-left / slide-up / fade / none)",
-    "    - primaryCTA: 이 화면의 가장 중요한 단일 행동 (버튼명 + 이동 대상)",
-    "    - secondaryCTA: 보조 행동 (없으면 null)",
-    "    - keyComponents: 이 화면의 UI 컴포넌트 배열",
-    "      각 컴포넌트: componentName / position(top|middle|bottom|overlay) / layoutHint / visibilityCondition / mainActions",
-    "      이미지를 포함하는 컴포넌트는 image_aspect_ratio(예: 16:9, 1:1, 4:3)와 image_size(예: thumbnail, medium, full-width) 필드를 추가",
-    "    - entryPoints: 어떤 화면/행동에서 이 화면으로 진입하는가",
-    "    - exitActions: 이 화면에서 어디로 나갈 수 있는가 (여기서 참조하는 화면은 반드시 screens에 존재해야 함)",
-    "",
-    "  조건부 필드 (해당하는 화면에만 포함):",
-    "    - listItemSpec: 리스트/피드 화면에만 — 각 아이템에 표시되는 정보와 레이아웃",
-    "    - formValidation: 폼 입력 화면에만 — 각 필드의 유효성 검사 방식과 에러 표시",
-    "",
-    "  상태 참조 필드 (공통 사용 시 value:'global', 이 화면만 다를 경우 value:'custom' + 구체적 override 내용):",
-    "    - emptyStateRef",
-    "    - loadingStateRef",
-    "    - errorStateRef",
+    "이 서비스에 필요한 모든 화면.",
+    "  필수 필드: screenName / purpose / targetUsers / headerType / navigationType / layoutType / transition_type / primaryCTA / secondaryCTA / keyComponents / entryPoints / exitActions",
+    "  조건부: listItemSpec / formValidation / emptyStateRef / loadingStateRef / errorStateRef",
     "",
     "━━ 4. user_flows ━━",
-    "이 서비스의 핵심 태스크 플로우 (예상 3~6개).",
-    "각 플로우:",
-    "  - flowName: 플로우 이름",
-    "  - triggerCondition: 어떤 상황에서 시작되는가",
-    "  - steps 배열: step번호 / screenName / userAction / uiResponse / nextScreenCondition",
+    "핵심 태스크 플로우 (3~6개). 각: flowName / triggerCondition / steps[]",
     "",
     "【스키마 깊이 기준】",
     "pretty-print 기준 1500~2000 라인 목표.",
-    "각 필드를 실제 프론트엔드 구현에 바로 쓸 수 있을 수준으로 세분화해라.",
-    "단, 반복 구조를 그대로 복붙하지 말고 global_design_system으로 빼서 참조하라.",
-    "필드 수가 많아지더라도 value는 채우지 말고 null로 남겨라. 필드가 존재하는 것이 중요하다.",
     "",
-    "【status 판단 기준 — 1차 스키마는 추론을 최대한 자제한다. 사용자가 말한 것만 채운다.】",
-    "",
-    "fulled: 사용자가 1차 인터뷰에서 '직접 언급'한 내용만. 추론·예측·상식으로 채운 값은 절대 fulled 금지.",
-    "",
-    "null: 사용자가 명시적으로 언급하지 않은 모든 UI 세부사항. 추론하지 말고 null로 남겨라.",
-    "  - 버튼 모양, 카드 스타일, 폰트 크기, 여백, 리스트 형태, 헤더 타입, 로딩 방식, 색상 세부, 아이콘 스타일 등",
-    "  - AI가 '이 서비스라면 이렇겠지'라고 예측할 수 있어도 null이다.",
-    "  - null은 2차 인터뷰에서 사용자에게 직접 확인할 항목이다.",
-    "",
-    "expected: 극히 제한적으로만 사용. 서비스 유형상 존재 자체가 거의 확실한 것만.",
-    "  - 예: 쇼핑몰의 장바구니 화면 존재 여부, 예약 서비스의 예약 내역 화면 존재 여부",
-    "  - expected는 전체 필드의 최대 10~15%만 허용.",
-    "",
-    "【핵심: 전체 필드의 50% 이상이 반드시 null이어야 한다. 이 비율을 지키지 않으면 2차 인터뷰가 무의미해진다.】",
-    "【AI의 추론은 2차 인터뷰 단계에서 한다. 1차 스키마에서는 절대 추론하지 마라.】",
+    "【status 판단 기준】",
+    "fulled: 사용자가 직접 언급한 내용만. 추론·예측·상식으로 채운 값은 절대 fulled 금지.",
+    "null: 사용자가 명시적으로 언급하지 않은 모든 UI 세부사항.",
+    "expected: 극히 제한적으로만 사용. 전체 필드의 최대 10~15%만 허용.",
+    "【핵심: 전체 필드의 50% 이상이 반드시 null이어야 한다.】",
     "",
     "반드시 JSON만 반환한다. 설명 텍스트, 마크다운, 코드블록 없이 순수 JSON만.",
   ].join("\n");
@@ -466,19 +376,15 @@ export async function generateUIBriefingFromAnswers(
     JSON.stringify(qaList, null, 2),
   );
 
-  const userPrompt = userPromptParts.join("\n");
-
   try {
-    const response = await requestClaudeJson<Record<string, unknown>>({
+    return await requestGeminiJson<Record<string, unknown>>({
+      taskId: "initialBriefing",
       systemPrompt,
-      userPrompt,
-      model: "sonnet",
+      userPrompt: userPromptParts.join("\n"),
       temperature: 0.4,
-      maxTokens: 16384,
     });
-    return response;
   } catch (error) {
-    console.error("[generateUIBriefingFromAnswers] Claude API failed:", error);
+    console.error("[generateUIBriefingFromAnswers] Gemini API failed:", error);
     return {
       service: {
         name: { value: null, status: "null" },
@@ -506,82 +412,7 @@ export async function generateUIBriefingFromAnswers(
 }
 
 /**
- * 2차 인터뷰 시작 전 — 공통/지엽적 필드를 AI가 자동 추론하여 일괄 채움 (Claude Sonnet)
- */
-export async function autoFillCommonFields(
-  briefingJson: Record<string, unknown>,
-  unresolvedTargets: InterviewTarget[],
-): Promise<InterviewFieldUpdate[]> {
-  if (unresolvedTargets.length === 0) return [];
-
-  const systemPrompt = [
-    "너는 UI/UX 전문가로서 브리핑 JSON의 지엽적·공통적·반복적 필드를 서비스 성격에 맞게 자동으로 채우는 AI다.",
-    "",
-    "【자동으로 채워야 하는 필드 유형】",
-    "아래 유형의 필드는 사용자에게 물어볼 필요 없이 AI가 서비스 성격과 이미 fulled인 값을 참고해서 합리적으로 결정한다:",
-    "  - typography_hierarchy: 모든 폰트 크기, 줄 간격, 굵기",
-    "  - spacing_rules: 여백 단위, 간격 수치, 밀도",
-    "  - component_style 세부값: border_radius, elevation, inner_padding, focus_indicator, size_variants",
-    "  - shared_states: 로딩 방식, 에러 표시, 토스트 위치/스타일/duration",
-    "  - breakpoints: 반응형 기준 수치",
-    "  - formValidation: 에러 메시지 문구, 유효성 규칙",
-    "  - 각 화면의 emptyStateRef, loadingStateRef, errorStateRef (대부분 global로 통일)",
-    "  - 각 화면의 transition_type (서비스 흐름에 맞게 일괄 결정)",
-    "  - 이미지 포함 컴포넌트의 image_aspect_ratio, image_size",
-    "",
-    "【채우지 않는 필드】",
-    "다음은 사용자의 의견이 필요하므로 건드리지 않는다:",
-    "  - 각 화면의 layoutType, primaryCTA, secondaryCTA, keyComponents 구성",
-    "  - 화면 간 네비게이션 결정 (어디로 이동할지)",
-    "  - 전체 분위기/스타일 방향",
-    "  - 화면의 핵심 기능이나 콘텐츠 구성",
-    "",
-    "【규칙】",
-    "- fulled인 값은 절대 수정하지 않는다.",
-    "- 화면마다 반복되는 필드(headerType, transition_type 등)는 첫 번째 화면의 패턴을 참고해서 나머지에 일괄 적용한다.",
-    "- confidence는 0.5로 설정한다.",
-    "- note에 'AI 자동 채움 - 공통 필드'라고 표시한다.",
-    "",
-    '반드시 JSON만 반환. 형식: {"updates":[{"path":"...","value":"...","confidence":0.5,"note":"AI 자동 채움 - 공통 필드"}]}',
-  ].join("\n");
-
-  const userPrompt = [
-    "현재 브리핑 JSON:",
-    JSON.stringify(briefingJson, null, 2),
-    "",
-    "아직 null인 필드 목록:",
-    JSON.stringify(unresolvedTargets, null, 2),
-    "",
-    "위 목록에서 사용자에게 물어볼 필요 없는 지엽적/공통적/반복적 필드를 찾아서 합리적인 값으로 채워라.",
-    '형식: {"updates":[...]}',
-  ].join("\n");
-
-  try {
-    const response = await requestClaudeJson<{ updates?: unknown }>({
-      systemPrompt,
-      userPrompt,
-      model: "sonnet",
-      temperature: 0.2,
-    });
-
-    if (!Array.isArray(response.updates)) return [];
-
-    return (response.updates as Array<Record<string, unknown>>)
-      .filter((u) => typeof u.path === "string" && u.path)
-      .map((u) => ({
-        path: u.path as string,
-        value: u.value,
-        confidence: typeof u.confidence === "number" ? u.confidence : 0.5,
-        note: (u.note as string) || "AI 자동 채움 - 공통 필드",
-      }));
-  } catch (error) {
-    console.error("[autoFillCommonFields] failed:", error);
-    return [];
-  }
-}
-
-/**
- * 2차 인터뷰 질문 생성 (Claude Sonnet)
+ * 2차 인터뷰 질문 생성
  */
 export async function generateInterviewQuestionBatchDirect(input: {
   briefingJson: Record<string, unknown>;
@@ -592,9 +423,7 @@ export async function generateInterviewQuestionBatchDirect(input: {
 }): Promise<GeneratedInterviewQuestion[]> {
   const maxQuestions = Math.min(Math.max(input.maxQuestions || 10, 1), 10);
   const fallbackQuestions = createFallbackQuestions(input.unresolvedTargets, maxQuestions);
-  if (input.unresolvedTargets.length === 0) {
-    return [];
-  }
+  if (input.unresolvedTargets.length === 0) return [];
 
   const systemPrompt = [
     "너는 비개발자 사용자와 대화하면서 서비스 UI를 함께 설계하는 친근한 AI 도우미다.",
@@ -604,41 +433,21 @@ export async function generateInterviewQuestionBatchDirect(input: {
     "- 친구에게 물어보듯 쉽고 친근하게 질문한다.",
     "- '줄 간격', '여백 단위', '바텀시트', 'CTA', '포커스 인디케이터' 같은 개발/디자인 용어는 절대 쓰지 않는다.",
     "- 대신 실생활 비유와 구체적 예시로 물어본다.",
-    "  나쁜 예: '카드 border-radius를 정해주세요'",
-    "  좋은 예: '목록에서 가게 하나하나가 네모 카드로 보일 건데, 모서리가 둥글둥글한 게 좋을까요 아니면 각진 게 좋을까요?'",
-    "  나쁜 예: '바텀시트 사용 여부를 정해주세요'",
-    "  좋은 예: '가게를 눌렀을 때 화면 전체가 바뀌는 게 좋을까요, 아니면 아래에서 슬쩍 올라오는 미리보기가 좋을까요?'",
     "",
     "【AI가 직접 추론해서 채울 것 — 질문하지 않는다】",
-    "다음은 사용자에게 물어봐야 할 수준이 아니다. AI가 서비스 성격과 이미 채워진 답변을 바탕으로 직접 결정한다:",
-    "  - typography_hierarchy (폰트 크기, 줄 간격, 굵기 등 모든 텍스트 수치)",
-    "  - spacing_rules (여백 단위, 간격 수치, 밀도)",
-    "  - component_style의 세부 수치 (border_radius, elevation, inner_padding, focus_indicator 등)",
-    "  - shared_states (로딩 방식, 에러 표시, 토스트 위치 등)",
-    "  - formValidation의 에러 메시지 문구",
-    "  - breakpoints 수치",
-    "이 항목들은 질문 대신 targetFields에 넣고 AI가 답변 적용 시 함께 추론해서 채운다.",
+    "다음은 사용자에게 물어봐야 할 수준이 아니다:",
+    "  - typography_hierarchy, spacing_rules, component_style 세부 수치",
+    "  - shared_states, formValidation 에러 메시지, breakpoints 수치",
     "",
     "【질문 우선순위 — 화면 단위로 물어본다】",
-    "  1순위: 각 화면이 어떤 모습이어야 하는지 (사용자가 체감하는 수준의 질문)",
-    "     - 이 화면에 들어오면 뭐가 가장 먼저 보여야 하나요?",
-    "     - 목록은 사진이 크게 보이는 게 좋을까요, 정보가 한눈에 보이는 게 좋을까요?",
-    "     - 여기서 가장 중요한 버튼은 뭔가요? 어디에 있으면 좋겠어요?",
+    "  1순위: 각 화면이 어떤 모습이어야 하는지",
     "  2순위: 화면 간 이동 방식",
-    "     - 이 버튼을 누르면 새 화면으로 넘어갈까요, 아래에서 슬쩍 올라올까요?",
     "  3순위: 전체 분위기/스타일 (큰 그림 수준만)",
-    "     - 전체적으로 둥글둥글한 느낌? 각진 느낌? 그림자가 있는 입체감?",
-    "",
-    "【'알아서 해줘' 또는 위임형 답변 처리】",
-    "사용자가 '알아서 해줘', '상관없어', '모르겠어' 등으로 답하면:",
-    "  - 서비스 성격에 맞는 구체적인 옵션 2~3개를 비유와 함께 제안하는 질문으로 바꾼다.",
-    "  - 예: '비슷한 앱들을 보면 ①카카오톡처럼 깔끔한 목록 ②인스타그램처럼 사진 위주 ③당근마켓처럼 카드형이 있는데, 어떤 느낌이 가장 가까워요?'",
     "",
     "【질문 품질 규칙】",
     "- 질문은 최대 10개. 짧고 자연스럽게.",
-    "- 한 질문은 하나의 주제만 묻는다. 여러 주제를 억지로 묶어서 길어지게 하지 않는다.",
-    "- 이전 라운드에서 이미 물어본 것과 같은 유형의 질문은 반복하지 않는다. (답변 적용 시 AI가 다른 화면에 추론 적용하므로)",
-    "- placeholder는 실제 앱 이름이나 구체적 예시를 들어 안내한다.",
+    "- 한 질문은 하나의 주제만 묻는다.",
+    "- 이전 라운드에서 이미 물어본 유형은 반복하지 않는다.",
     "- 이미 fulled인 항목은 다시 묻지 않는다.",
     "",
     '반드시 JSON만 반환하고 형식은 {"questions":[...]} 이어야 한다.',
@@ -658,14 +467,14 @@ export async function generateInterviewQuestionBatchDirect(input: {
     JSON.stringify(input.interviewHistory, null, 2),
     "",
     `최대 ${maxQuestions}개의 질문만 반환해라.`,
-    '다음 형식으로만 답해라: {"questions":[{"id":"...","question":"...","reason":"...","placeholder":"...","targetFields":["...","..."]}]}',
+    '형식: {"questions":[{"id":"...","question":"...","reason":"...","placeholder":"...","targetFields":["...","..."]}]}',
   ].join("\n");
 
   try {
-    const response = await requestClaudeJson<unknown>({
+    const response = await requestGeminiJson<unknown>({
+      taskId: "secondaryInterviewQuestion",
       systemPrompt,
       userPrompt,
-      model: "sonnet",
       temperature: 0.3,
     });
 
@@ -676,7 +485,7 @@ export async function generateInterviewQuestionBatchDirect(input: {
 }
 
 /**
- * 2차 인터뷰 답변 → 필드 업데이트 추출 (Claude Sonnet)
+ * 2차 인터뷰 답변 → 필드 업데이트 추출
  */
 export async function applyInterviewAnswersBatchDirect(input: {
   briefingJson: Record<string, unknown>;
@@ -693,10 +502,7 @@ export async function applyInterviewAnswersBatchDirect(input: {
   const fallbackUpdates = answeredQuestions
     .map((question): InterviewFieldUpdate | null => {
       const firstTarget = question.targetFields[0];
-      if (!firstTarget) {
-        return null;
-      }
-
+      if (!firstTarget) return null;
       return {
         path: firstTarget,
         value: question.answer,
@@ -706,64 +512,31 @@ export async function applyInterviewAnswersBatchDirect(input: {
     })
     .filter((item): item is InterviewFieldUpdate => item !== null);
 
-  if (answeredQuestions.length === 0) {
-    return [];
-  }
+  if (answeredQuestions.length === 0) return [];
 
   const systemPrompt = [
     "너는 UI 설계 인터뷰 답변을 구조화 JSON 필드 업데이트로 바꾸는 AI다.",
     "전체 JSON을 다시 만들지 말고 updates 배열만 반환한다.",
     "기존 status가 fulled인 값은 절대 수정하거나 덮어쓰지 않는다.",
-    "각 질문의 targetFields와 직접 관련된 UI 경로만 업데이트한다.",
-    "한 질문의 답으로 여러 UI 필드를 같이 채울 수 있으면 그렇게 한다.",
     "",
     "【2차 인터뷰에서는 AI가 최대한 공격적으로 추론한다】",
-    "1차 스키마는 보수적으로 null을 많이 남겼다. 2차 인터뷰는 이 null을 최대한 빠르게 채우는 단계다.",
     "사용자의 답변 하나에서 가능한 모든 null 필드를 추론하여 채워라.",
     "",
-    "【추론 확장 범위 — 3단계로 넓혀라】",
-    "",
-    "1단계 (직접): 사용자가 답변에서 직접 언급한 필드를 채운다.",
-    "",
-    "2단계 (같은 유형 일괄): 같은 유형의 필드가 다른 화면에도 null로 있으면 모두 함께 채운다.",
-    "  예: 검색 화면의 headerType을 답하면 → 모든 화면의 headerType을 추론",
-    "  예: 목록 카드 스타일을 답하면 → 모든 리스트 화면의 listItemSpec을 추론",
-    "  예: 화면 전환 방식을 답하면 → 모든 화면의 transition_type을 추론",
-    "",
-    "3단계 (연쇄 추론): 이번 라운드의 답변 전체 맥락에서, 아직 null인 관련 필드를 최대한 추론한다.",
-    "  예: 사용자가 '깔끔하고 심플하게'라는 분위기를 여러 답변에서 보였으면",
-    "    → typography_hierarchy의 모든 null 필드를 깔끔한 스타일로 채운다",
-    "    → spacing_rules의 null 필드를 comfortable/넉넉하게 채운다",
-    "    → component_style의 null 필드를 미니멀 방향으로 채운다",
-    "    → 모든 화면의 emptyStateRef, loadingStateRef, errorStateRef를 global로 채운다",
-    "  예: 사용자가 특정 화면 구성을 답했으면",
-    "    → 그 화면의 navigationType, layoutType, entryPoints, exitActions도 추론 가능하면 채운다",
-    "    → formValidation이 null인 폼 화면이 있으면 서비스 성격에 맞게 추론한다",
+    "【추론 확장 범위 — 3단계】",
+    "1단계 (직접): 사용자가 답변에서 직접 언급한 필드",
+    "2단계 (같은 유형 일괄): 같은 유형의 필드가 다른 화면에도 null로 있으면 모두 함께",
+    "3단계 (연쇄 추론): 이번 라운드의 답변 전체 맥락에서 관련 필드를 최대한 추론",
     "",
     "【목표: 한 라운드(10개 질문)의 답변 적용으로 전체 null 필드의 30% 이상을 채워라.】",
-    "targetFields에 없는 경로라도, 논리적으로 도출 가능한 모든 필드에 업데이트를 만들어라.",
-    "updates 배열의 길이가 60~80개가 되는 것을 목표로 하라. 적게 보내면 인터뷰가 끝없이 반복된다.",
+    "updates 배열의 길이가 60~80개가 되는 것을 목표로 하라.",
     "",
-    "【위임형 답변 처리 규칙】",
-    "사용자가 '알아서 해줘', '상관없어', '모르겠어', '자유롭게 해줘', '네', '응', '맞아', '그냥 해줘' 처럼",
-    "구체적인 내용 없이 AI에게 판단을 맡기는 답변을 했다면:",
-    "  - 빈 배열 [] 을 반환하지 말고, 서비스 성격에 맞는 가장 합리적인 값을 AI가 직접 추론해서 적용한다.",
-    "  - confidence는 0.25로 설정한다.",
-    "  - note 필드에 반드시 '사용자 위임 - AI 추론값' 이라고 명시한다.",
-    "  - 추론값은 구체적인 문자열이어야 한다. 예: '둥글고 부드러운 카드 스타일, 그림자 약하게'",
+    "【위임형 답변 처리】",
+    "'알아서 해줘', '상관없어' 등 → AI가 직접 추론, confidence 0.25, note에 '사용자 위임 - AI 추론값'",
     "",
-    "【단순 긍정 답변 처리 규칙】",
-    "사용자가 확인 질문에 '네', '맞아요', '좋아요' 등 단순 긍정으로 답했다면:",
-    "  - 질문에서 AI가 제안했던 구체적인 값을 그대로 적용한다.",
-    "  - confidence는 0.8로 설정한다.",
+    "【confidence 기준】",
+    "직접 언급: 0.9 / 논리적 도출: 0.6 / AI 추론: 0.4 / 위임: 0.25",
     "",
-    "【추론 업데이트의 confidence 기준】",
-    "  - 사용자가 직접 말한 값: confidence 0.9",
-    "  - 답변에서 논리적으로 도출한 관련 값: confidence 0.6",
-    "  - 서비스 성격 기반 AI 추론: confidence 0.4",
-    "  - 위임형 답변 기반 AI 추론: confidence 0.25",
-    "",
-    '반드시 JSON만 반환하고 형식은 {"updates":[...]} 이어야 한다.',
+    '반드시 JSON만 반환. 형식: {"updates":[{"path":"...","value":"...","confidence":0.0,"note":"..."}]}',
   ].join("\n");
 
   const userPrompt = [
@@ -773,25 +546,20 @@ export async function applyInterviewAnswersBatchDirect(input: {
     "질문과 답변 묶음:",
     JSON.stringify(answeredQuestions, null, 2),
     "",
-    '다음 형식으로만 답해라: {"updates":[{"path":"...","value":"...","confidence":0.0,"note":"..."}]}',
+    '형식: {"updates":[{"path":"...","value":"...","confidence":0.0,"note":"..."}]}',
   ].join("\n");
 
   try {
-    const response = await requestClaudeJson<{ updates?: unknown }>({
+    const response = await requestGeminiJson<{ updates?: unknown }>({
+      taskId: "secondaryInterviewFill",
       systemPrompt,
       userPrompt,
-      model: "sonnet",
       temperature: 0.2,
     });
 
-    console.log("[applyAnswers] AI raw response updates 수:", Array.isArray(response.updates) ? response.updates.length : "not array");
-    console.log("[applyAnswers] AI raw response:", JSON.stringify(response.updates, null, 2)?.slice(0, 2000));
-
+    console.log("[applyAnswers] AI raw updates 수:", Array.isArray(response.updates) ? response.updates.length : "not array");
     const updates = normalizeUpdatePayload(response.updates);
     console.log("[applyAnswers] normalize 후 updates 수:", updates.length);
-    if (updates.length === 0) {
-      console.warn("[applyAnswers] updates가 0개 → fallback 사용");
-    }
     return updates.length > 0 ? updates : fallbackUpdates;
   } catch (error) {
     console.error("[applyAnswers] API 실패:", error);
@@ -800,7 +568,7 @@ export async function applyInterviewAnswersBatchDirect(input: {
 }
 
 /**
- * 홈페이지 인터뷰 답변 → 홈페이지 단일 화면 구현 가이드 MD 생성 (Claude Sonnet)
+ * 홈페이지 인터뷰 답변 → 홈페이지 단일 화면 구현 가이드 MD 생성
  */
 export async function generateHomepageMd(
   qaList: Array<{ question: string; answer: string }>,
@@ -811,52 +579,24 @@ export async function generateHomepageMd(
     "",
     "【문서의 목적】",
     "이 문서를 받은 개발자가 추가 질문 없이 홈페이지 화면을 바로 구현할 수 있어야 한다.",
-    "오직 홈페이지(메인 페이지) 하나만 다룬다. 다른 페이지는 언급하지 않는다.",
+    "오직 홈페이지(메인 페이지) 하나만 다룬다.",
     "",
     "【반드시 포함할 섹션】",
-    "",
-    "# 1. 서비스 개요",
-    "- 서비스 이름 / 한 줄 설명",
-    "- 타겟 사용자",
-    "- 플랫폼 (웹/앱/둘 다)",
-    "",
-    "# 2. 홈 화면 레이아웃 구조",
-    "- 전체 레이아웃을 ASCII 와이어프레임으로 시각화",
-    "- 각 섹션의 위치와 역할 설명",
-    "- 헤더 / 히어로 / 콘텐츠 영역 / 푸터 구성",
-    "",
-    "# 3. 섹션별 상세 명세",
-    "- 각 섹션마다: 섹션 이름, 목적, 포함 요소, 레이아웃 힌트",
-    "- 히어로 영역: 메인 카피, CTA 버튼, 배경 처리",
-    "- 콘텐츠 영역: 카드/리스트/그리드 구성, 아이템 구조",
-    "- 네비게이션: 메뉴 항목, 로고 위치, 반응형 처리",
-    "",
+    "# 1. 서비스 개요 (이름, 설명, 타겟, 플랫폼)",
+    "# 2. 홈 화면 레이아웃 구조 (ASCII 와이어프레임)",
+    "# 3. 섹션별 상세 명세 (히어로, 콘텐츠, 네비게이션)",
     "# 4. 주요 인터랙션 & CTA",
-    "- 버튼/링크 목록과 각각의 동작",
-    "- 호버/클릭/스크롤 시 기대 동작",
-    "",
     "# 5. 디자인 톤 & 스타일 가이드",
-    "- 전체 분위기 키워드",
-    "- 참고 서비스에서 가져올 디자인 요소",
-    "- 색상 방향 (primary / background / accent 제안)",
-    "- 타이포그래피 방향 (제목 / 본문 / 캡션)",
-    "- 여백과 밀도 방향",
-    "",
     "# 6. 반응형 대응",
-    "- 데스크탑 / 태블릿 / 모바일 각각의 레이아웃 변화",
-    "- 모바일에서의 네비게이션 처리 (햄버거 메뉴 등)",
-    "",
     "# 7. 컴포넌트 목록",
-    "- 이 홈페이지에서 필요한 컴포넌트를 리스트업",
-    "- 각 컴포넌트: 이름, props 설명, 위치",
     "",
     "【작성 규칙】",
-    "- 한국어로 작성한다.",
-    "- 마크다운 형식으로 깔끔하게 구조화한다.",
-    "- 코드블록이 아닌 설계 가이드 문서다.",
-    "- 사용자가 직접 말한 내용은 최대한 반영하고, 말하지 않은 부분은 서비스 성격에 맞게 합리적으로 추론한다.",
-    "- 추론한 부분은 '(AI 제안)' 태그를 붙여서 사용자가 나중에 수정할 수 있게 한다.",
+    "- 한국어로 작성.",
+    "- 마크다운 형식.",
+    "- 추론한 부분은 '(AI 제안)' 태그를 붙인다.",
     "- 백엔드, API, 데이터베이스 관련 내용은 포함하지 않는다.",
+    "",
+    '결과를 JSON으로 감싸서 반환: {"markdown":"..."}',
   ].join("\n");
 
   const userPrompt = [
@@ -866,11 +606,25 @@ export async function generateHomepageMd(
     JSON.stringify(qaList, null, 2),
   ].join("\n");
 
-  return requestClaudeText({
-    systemPrompt,
-    userPrompt,
-    model: "sonnet",
-    temperature: 0.4,
-    maxTokens: 8192,
-  });
+  try {
+    const response = await requestGeminiJson<unknown>({
+      taskId: "homepageMd",
+      systemPrompt,
+      userPrompt,
+      temperature: 0.4,
+    });
+
+    if (response && typeof response === "object") {
+      const md = (response as Record<string, unknown>).markdown;
+      if (typeof md === "string" && md.trim()) return md.trim();
+    }
+
+    // If response is a plain string (unlikely with responseMimeType=json)
+    if (typeof response === "string") return response;
+
+    throw new Error("Invalid response format");
+  } catch (error) {
+    console.error("[generateHomepageMd] Gemini API failed:", error);
+    throw error;
+  }
 }

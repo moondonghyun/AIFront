@@ -110,7 +110,7 @@ const HomepageResultScreen = ({
           className="flex-1 gap-2 rounded-full bg-violet-600 hover:bg-violet-700"
           onClick={onContinue}
         >
-          전체 서비스 설계로 이어가기
+          홈 화면 3안 만들기
           <ArrowRight className="h-4 w-4" />
         </Button>
       </div>
