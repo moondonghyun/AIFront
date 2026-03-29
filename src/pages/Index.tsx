@@ -7,6 +7,8 @@ import type { CatPersonality } from "@/components/CatCharacter";
 import IntroScreen, { type TrackChoice } from "@/components/IntroScreen";
 import HomepageInterviewScreen from "@/components/HomepageInterviewScreen";
 import HomepageResultScreen from "@/components/HomepageResultScreen";
+import QuestionScreen from "@/components/QuestionScreen";
+import ReviewScreen from "@/components/ReviewScreen";
 import SecondaryInterviewScreen from "@/components/SecondaryInterviewScreen";
 import BriefingCompleteScreen from "@/components/BriefingCompleteScreen";
 import HomeStyleScreen from "@/components/HomeStyleScreen";
@@ -16,6 +18,7 @@ import FullAppScreen from "@/components/FullAppScreen";
 
 // ─── Data ───
 import { homepageQuestions } from "@/data/homepage-questions";
+import { questions } from "@/data/questions";
 
 // ─── Types ───
 import type { GeneratedInterviewQuestion, InterviewHistoryEntry } from "@/lib/ai-types";
@@ -52,11 +55,21 @@ import type { FullWebProject } from "@/lib/gemini-direct";
 
 // ─── Phase State Machine ───
 //
-// intro → homepage-interview → generating-homepage-md → homepage-result
+// 0차 인터뷰 (홈페이지):
+//   intro → homepage-interview → generating-homepage-md → homepage-result
+//
+// 홈 UI 3안:
 //   → generating-home-style → home-style → home-style-selected
 //   → generating-home-style-md → home-style-md
-//   → generating-briefing (structured JSON from homepageMd + homeStyleMd)
-//   → generating-question → secondary-interview → applying-answer → (loop) → ui-ready
+//
+// 1차 고정 인터뷰 (13문):
+//   → interview → review
+//
+// 구조화 JSON 생성 + 2차 인터뷰:
+//   → generating-briefing → generating-question → secondary-interview
+//   → applying-answer → (loop) → ui-ready
+//
+// 최종 결과물:
 //   → generating-full-app → full-app
 
 type Phase =
@@ -70,7 +83,10 @@ type Phase =
   | "home-style-selected"
   | "generating-home-style-md"
   | "home-style-md"
-  // Briefing generation + secondary interview
+  // 1차 고정 인터뷰 (13문)
+  | "interview"
+  | "review"
+  // 구조화 JSON 생성 + 2차 인터뷰
   | "generating-briefing"
   | "generating-question"
   | "secondary-interview"
@@ -121,7 +137,7 @@ const Index = () => {
   const [phase, setPhase] = useState<Phase>("intro");
   const [personality, setPersonality] = useState<CatPersonality>("smart");
 
-  // ─── Homepage interview state ───
+  // ─── 0차 인터뷰 (홈페이지) state ───
   const [hpStep, setHpStep] = useState(0);
   const [hpAnswers, setHpAnswers] = useState<string[]>(
     Array(homepageQuestions.length).fill(""),
@@ -129,7 +145,12 @@ const Index = () => {
   const [hpDirection, setHpDirection] = useState<1 | -1>(1);
   const [homepageMd, setHomepageMd] = useState<string | null>(null);
 
-  // ─── Briefing & interview state ───
+  // ─── 1차 고정 인터뷰 (13문) state ───
+  const [currentStep, setCurrentStep] = useState(0);
+  const [answers, setAnswers] = useState<string[]>(Array(questions.length).fill(""));
+  const [direction, setDirection] = useState<1 | -1>(1);
+
+  // ─── 구조화 JSON & 2차 인터뷰 state ───
   const [briefingJson, setBriefingJson] = useState<Record<string, unknown> | null>(null);
   const [initialTargetPaths, setInitialTargetPaths] = useState<string[]>([]);
   const [currentInterviewQuestions, setCurrentInterviewQuestions] = useState<
@@ -156,7 +177,7 @@ const Index = () => {
   );
 
   // ═══════════════════════════════════════════════════════════════════
-  // Homepage interview handlers
+  // 0차 인터뷰 (홈페이지) handlers
   // ═══════════════════════════════════════════════════════════════════
 
   const updateHpAnswer = useCallback((index: number, value: string) => {
@@ -206,7 +227,6 @@ const Index = () => {
   const handleContinueToHomeStyle = useCallback(async () => {
     if (!homepageMd) return;
 
-    // Markdown briefing for home style generation (supports this format)
     const mdBriefing: Record<string, unknown> = {
       _format: "markdown",
       content: homepageMd,
@@ -289,50 +309,132 @@ const Index = () => {
   );
 
   // ═══════════════════════════════════════════════════════════════════
-  // home-style-md → generate structured briefing JSON → secondary interview
+  // 1차 고정 인터뷰 (13문) handlers
   // ═══════════════════════════════════════════════════════════════════
 
-  const handleGenerateBriefingAndStartInterview = useCallback(async () => {
+  const updateAnswer = useCallback((index: number, value: string) => {
+    setAnswers((prev) => {
+      const next = [...prev];
+      next[index] = value;
+      return next;
+    });
+  }, []);
+
+  const goNext = useCallback(() => {
+    const currentQuestion = questions[currentStep];
+    if (currentQuestion.skipLogic) {
+      const { value, skipTo } = currentQuestion.skipLogic;
+      if (answers[currentStep] === value) {
+        const skipToIndex = questions.findIndex((q) => q.id === skipTo);
+        if (skipToIndex !== -1 && skipToIndex < questions.length) {
+          setDirection(1);
+          setCurrentStep(skipToIndex);
+          return;
+        }
+      }
+    }
+
+    if (currentStep < questions.length - 1) {
+      setDirection(1);
+      setCurrentStep((step) => step + 1);
+      return;
+    }
+
+    setPhase("review");
+  }, [currentStep, answers]);
+
+  const goPrev = useCallback(() => {
+    if (currentStep > 0) {
+      setDirection(-1);
+      setCurrentStep((step) => step - 1);
+    }
+  }, [currentStep]);
+
+  const goToQuestion = useCallback(
+    (index: number) => {
+      setDirection(index > currentStep ? 1 : -1);
+      setCurrentStep(index);
+      setPhase("interview");
+    },
+    [currentStep],
+  );
+
+  // ═══════════════════════════════════════════════════════════════════
+  // review 완료 → 구조화 JSON 생성 → 2차 인터뷰 시작
+  //
+  // 입력:
+  //   - 0차 인터뷰 로그 (hpAnswers from homepageQuestions)
+  //   - 1차 인터뷰 로그 (answers from questions)
+  //   - 선택된 홈 화면 스타일 MD (homeStyleMd)
+  //
+  // 출력:
+  //   - 구조화 JSON with {value, status} 필드
+  //     fulled  = 사용자 입력으로 이미 채워진 것
+  //     expected = AI가 추론, 추가 질문으로 확인 권장
+  //     null    = 아직 비어있어 반드시 채워야 할 것
+  // ═══════════════════════════════════════════════════════════════════
+
+  const handleReviewComplete = useCallback(async () => {
     setPhase("generating-briefing");
     setCurrentInterviewQuestions([]);
     setInterviewHistory([]);
     interviewRound.current = 0;
     totalQuestionsAsked.current = 0;
 
-    // Build QA from homepage interview answers
-    const qaList = homepageQuestions.map((q, i) => ({
-      question: q.title,
+    // 0차 인터뷰 QA (홈페이지 인터뷰)
+    const phase0QA = homepageQuestions.map((q, i) => ({
+      question: `[0차 홈페이지 인터뷰] ${q.title}`,
       answer: hpAnswers[i] || "",
     }));
 
-    // Combine homepageMd + homeStyleMd as context for briefing generation
+    // 1차 인터뷰 QA (고정 13문)
+    const phase1QA = questions.map((q, i) => ({
+      question: `[1차 고정 인터뷰] ${q.title}`,
+      answer: answers[i] || "",
+    }));
+
+    // 전체 QA를 합쳐서 briefing 생성에 전달
+    const allQA = [...phase0QA, ...phase1QA];
+
+    // 홈페이지 MD + 선택된 홈 화면 스타일 MD를 합쳐서 컨텍스트로 전달
     const combinedMd = [
+      "━━ 0차 인터뷰로 생성된 홈페이지 설계 문서 ━━",
       homepageMd || "",
       "",
-      "━━ 선택된 홈 화면 스타일 명세 ━━",
+      "━━ 사용자가 선택한 홈 화면 스타일 명세 ━━",
       homeStyleMd || "",
     ].join("\n");
 
     try {
-      // Generate structured briefing JSON with {value, status} fields
-      const json = await generateUIBriefingFromAnswers(qaList, combinedMd);
+      // 구조화 JSON 생성: fulled(사용자 입력) / expected(AI 추론 권장) / null(미입력)
+      const json = await generateUIBriefingFromAnswers(allQA, combinedMd);
+
+      console.log("[handleReviewComplete] 생성된 briefingJson 키:", Object.keys(json));
+      console.log("[handleReviewComplete] briefingJson 샘플 (2000자):", JSON.stringify(json, null, 2).slice(0, 2000));
+
       const targets = collectInterviewTargets(json);
       const targetPaths = targets.map((t) => t.path);
+
+      console.log("[handleReviewComplete] 발견된 target 수:", targets.length);
+      console.log("[handleReviewComplete] target 경로 샘플:", targetPaths.slice(0, 10));
+      console.log("[handleReviewComplete] target status 분포:",
+        targets.reduce((acc, t) => { acc[t.status] = (acc[t.status] || 0) + 1; return acc; }, {} as Record<string, number>),
+      );
 
       setBriefingJson(json);
       setInitialTargetPaths(targetPaths);
 
-      // Immediately start secondary interview
+      // 바로 2차 인터뷰 시작 (expected + null 필드를 대상으로 질문 생성)
       await requestNextInterviewBatch(json, targetPaths, []);
     } catch (error) {
       console.error("Failed to generate briefing JSON:", error);
       toast.error("UI 브리핑 생성에 실패했습니다.");
-      setPhase("home-style-md");
+      setPhase("review");
     }
-  }, [hpAnswers, homepageMd, homeStyleMd]);
+  }, [hpAnswers, answers, homepageMd, homeStyleMd]);
 
   // ═══════════════════════════════════════════════════════════════════
-  // Secondary interview loop
+  // 2차 인터뷰 loop (expected + null 필드를 채움)
   // ═══════════════════════════════════════════════════════════════════
 
   const requestNextInterviewBatch = useCallback(
@@ -465,7 +567,7 @@ const Index = () => {
   );
 
   // ═══════════════════════════════════════════════════════════════════
-  // ui-ready → directly generate full app (no additional-context)
+  // ui-ready → full app generation
   // ═══════════════════════════════════════════════════════════════════
 
   const handleGenerateFullApp = useCallback(async () => {
@@ -542,7 +644,7 @@ const Index = () => {
             />
           )}
 
-          {/* ── Homepage interview ── */}
+          {/* ── 0차 인터뷰 (홈페이지) ── */}
           {phase === "homepage-interview" && (
             <HomepageInterviewScreen
               key={`hp-${hpStep}`}
@@ -556,7 +658,6 @@ const Index = () => {
             />
           )}
 
-          {/* ── Homepage MD result → home style ── */}
           {(phase === "generating-homepage-md" || phase === "homepage-result") && (
             <HomepageResultScreen
               key="hp-result"
@@ -567,7 +668,7 @@ const Index = () => {
             />
           )}
 
-          {/* ── Home style 3안 ── */}
+          {/* ── 홈 UI 3안 ── */}
           {(phase === "generating-home-style" || phase === "home-style") &&
             briefingJson && (
               <HomeStyleScreen
@@ -608,11 +709,39 @@ const Index = () => {
                 homeStyleMd={homeStyleMd}
                 isGenerating={phase === "generating-home-style-md"}
                 onBack={() => setPhase("home-style-selected")}
-                onNext={handleGenerateBriefingAndStartInterview}
+                onNext={() => setPhase("interview")}
               />
             )}
 
-          {/* ── Briefing generation + secondary interview ── */}
+          {/* ── 1차 고정 인터뷰 (13문) ── */}
+          {phase === "interview" && (
+            <QuestionScreen
+              key={`q-${currentStep}`}
+              question={questions[currentStep]}
+              step={currentStep}
+              total={questions.length}
+              answer={answers[currentStep]}
+              direction={direction}
+              personality={personality}
+              onAnswer={(value) => updateAnswer(currentStep, value)}
+              onNext={goNext}
+              onPrev={goPrev}
+              isFirst={currentStep === 0}
+              isLast={currentStep === questions.length - 1}
+              prevAnswer={currentStep > 0 ? answers[currentStep - 1] : ""}
+            />
+          )}
+
+          {phase === "review" && (
+            <ReviewScreen
+              key="review"
+              answers={answers}
+              onEdit={goToQuestion}
+              onNext={handleReviewComplete}
+            />
+          )}
+
+          {/* ── 구조화 JSON 생성 + 2차 인터뷰 ── */}
           {(phase === "generating-briefing" ||
             phase === "generating-question" ||
             phase === "applying-answer" ||
@@ -631,32 +760,32 @@ const Index = () => {
               }
               loadingTitle={
                 phase === "generating-briefing"
-                  ? "홈 화면 스타일을 바탕으로 UI 브리핑을 만들고 있어요"
+                  ? "인터뷰 결과를 분석해서 UI 브리핑을 만들고 있어요"
                   : phase === "applying-answer"
                     ? "답변을 UI 브리핑에 반영하고 있어요"
                     : "다음 질문 묶음을 준비하고 있어요"
               }
               loadingDescription={
                 phase === "generating-briefing"
-                  ? "홈페이지 설계 문서와 선택한 홈 화면 스타일을 분석해서 구조화된 UI 브리핑을 만들고 있습니다."
+                  ? "0차·1차 인터뷰 답변과 선택한 홈 화면 스타일을 종합해서 구조화된 UI 브리핑 JSON을 만들고 있습니다."
                   : phase === "applying-answer"
                     ? "답변을 분석해서 UI 브리핑의 빈 항목을 채우고 있습니다."
                     : "남은 UI 항목을 묶어서 최대 10개의 질문으로 정리하고 있습니다."
               }
               onComplete={handleInterviewComplete}
-              onBack={() => setPhase("home-style-md")}
+              onBack={() => setPhase("review")}
               round={interviewRound.current}
             />
           )}
 
-          {/* ── ui-ready → directly to full app generation ── */}
+          {/* ── ui-ready → full app 생성 ── */}
           {phase === "ui-ready" && briefingJson && (
             <BriefingCompleteScreen
               key="ui-ready"
               briefingJson={briefingJson}
               progress={interviewProgress}
               selectedHomeStyle={selectedHomeStyle}
-              onBack={() => setPhase("home-style-md")}
+              onBack={() => setPhase("review")}
               onNext={handleGenerateFullApp}
             />
           )}
