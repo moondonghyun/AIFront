@@ -1,0 +1,7 @@
+project_id = "xdlpuytsihfesfleduuf"
+
+[functions.generate-interview]
+verify_jwt = false
+
+[functions.fill-briefing]
+verify_jwt = false
